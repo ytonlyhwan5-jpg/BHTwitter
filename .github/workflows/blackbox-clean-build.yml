@@ -50,32 +50,29 @@ jobs:
           python3 - <<'PY'
           from pathlib import Path
           import re
+          NL = chr(10)
 
-          # 1) Defense in depth: replace network uploader with a no-network stub.
           log_sender = Path("Bcore/src/main/java/top/niunaijun/blackbox/utils/LogSender.java")
           if not log_sender.exists():
               raise SystemExit("LogSender.java not found")
-          log_sender.write_text("""package top.niunaijun.blackbox.utils;
+          stub_lines = [
+              "package top.niunaijun.blackbox.utils;",
+              "",
+              "import java.io.File;",
+              "",
+              "public final class LogSender {",
+              '    private static final String TAG = "LogSender";',
+              "    private LogSender() {}",
+              "",
+              "    public static String send(String chatId, File logFile, String caption) {",
+              '        Slog.w(TAG, "Remote log upload disabled in privacy-clean build");',
+              '        return "Remote log upload disabled";',
+              "    }",
+              "}",
+              "",
+          ]
+          log_sender.write_text(NL.join(stub_lines), encoding="utf-8")
 
-          import java.io.File;
-
-          /**
-           * Privacy-clean build: remote log uploading is intentionally disabled.
-           * This class contains no networking code or remote endpoint.
-           */
-          public final class LogSender {
-              private static final String TAG = "LogSender";
-
-              private LogSender() {}
-
-              public static String send(String chatId, File logFile, String caption) {
-                  Slog.w(TAG, "Remote log upload disabled in privacy-clean build");
-                  return "Remote log upload disabled";
-              }
-          }
-          """, encoding="utf-8")
-
-          # 2) Stop BlackBoxCore.sendLogs() before it creates/captures logcat files.
           cfg = Path("Bcore/src/main/java/top/niunaijun/blackbox/app/configuration/ClientConfiguration.java")
           text = cfg.read_text(encoding="utf-8")
           old = 'return "-1003719573856";'
@@ -83,7 +80,6 @@ jobs:
               raise SystemExit("Expected hard-coded LogSender chat ID not found")
           cfg.write_text(text.replace(old, "return null;"), encoding="utf-8")
 
-          # 3) Replace BlackBoxCore log collection/upload path with a strict no-op.
           core = Path("Bcore/src/main/java/top/niunaijun/blackbox/BlackBoxCore.java")
           text = core.read_text(encoding="utf-8")
           start_marker = "    public void sendLogs(String caption, boolean async, LogSendListener listener) {"
@@ -92,28 +88,25 @@ jobs:
           end = text.find(end_marker, start)
           if start < 0 or end < 0:
               raise SystemExit("BlackBoxCore sendLogs block not found")
-          replacement = """    public void sendLogs(String caption, boolean async, LogSendListener listener) {
-        Slog.w(TAG, "Remote log collection/upload disabled in privacy-clean build");
-        if (listener != null) {
-            listener.onFailure("Remote log upload disabled");
-        }
-    }
+          replacement_lines = [
+              "    public void sendLogs(String caption, boolean async, LogSendListener listener) {",
+              '        Slog.w(TAG, "Remote log collection/upload disabled in privacy-clean build");',
+              "        if (listener != null) {",
+              '            listener.onFailure("Remote log upload disabled");',
+              "        }",
+              "    }",
+              "",
+          ]
+          core.write_text(text[:start] + NL.join(replacement_lines) + text[end:], encoding="utf-8")
 
-"""
-          core.write_text(text[:start] + replacement + text[end:], encoding="utf-8")
-
-          # 4) Remove the manual Send Logs UI code and preference completely.
           frag = Path("app/src/main/java/top/niunaijun/blackboxa/view/setting/SettingFragment.kt")
           text = frag.read_text(encoding="utf-8")
-          text = text.replace("\n        initSendLogs()\n", "\n")
+          text = text.replace(NL + "        initSendLogs()" + NL, NL)
           method_start = text.find("    private fun initSendLogs() {")
-          if method_start < 0:
-              raise SystemExit("SettingFragment initSendLogs method not found")
-          # Method is the final function before the class closing brace at this pinned commit.
-          class_end = text.rfind("\n}")
-          if class_end < method_start:
-              raise SystemExit("SettingFragment class end not found")
-          frag.write_text(text[:method_start] + text[class_end:] + "\n", encoding="utf-8")
+          class_end = text.rfind(NL + "}")
+          if method_start < 0 or class_end < method_start:
+              raise SystemExit("SettingFragment initSendLogs block not found")
+          frag.write_text(text[:method_start] + text[class_end:] + NL, encoding="utf-8")
 
           settings = Path("app/src/main/res/xml/setting.xml")
           text = settings.read_text(encoding="utf-8")
@@ -123,7 +116,6 @@ jobs:
               raise SystemExit(f"Expected one send_logs preference, removed {n}")
           settings.write_text(text2, encoding="utf-8")
 
-          # 5) Privacy audit: fail if uploader endpoints, IDs, or manual upload strings remain.
           forbidden = [
               "logs-sender-api.vercel.app",
               "-1003719573856",
@@ -131,9 +123,8 @@ jobs:
               "Upload debug logs to developer",
               "BlackBox Log Upload",
           ]
-          roots = [Path("app/src"), Path("Bcore/src")]
           hits = []
-          for root in roots:
+          for root in [Path("app/src"), Path("Bcore/src")]:
               for p in root.rglob("*"):
                   if not p.is_file():
                       continue
@@ -145,9 +136,8 @@ jobs:
                       if token in data:
                           hits.append(f"{p}: {token}")
           if hits:
-              raise SystemExit("Forbidden telemetry remnants found:\n" + "\n".join(hits))
-
-          print("Privacy cleanup OK: uploader stubbed, chat ID removed, Send Logs UI removed.")
+              raise SystemExit("Forbidden telemetry remnants found:" + NL + NL.join(hits))
+          print("Privacy cleanup OK")
           PY
 
       - name: Verify pinned upstream commit
