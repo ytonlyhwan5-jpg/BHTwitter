@@ -83,7 +83,38 @@ jobs:
               raise SystemExit("Expected hard-coded LogSender chat ID not found")
           cfg.write_text(text.replace(old, "return null;"), encoding="utf-8")
 
-          # 3) Remove the manual Send Logs preference from Settings UI.
+          # 3) Replace BlackBoxCore log collection/upload path with a strict no-op.
+          core = Path("Bcore/src/main/java/top/niunaijun/blackbox/BlackBoxCore.java")
+          text = core.read_text(encoding="utf-8")
+          start_marker = "    public void sendLogs(String caption, boolean async, LogSendListener listener) {"
+          end_marker = "    private String getDeviceInfoString() {"
+          start = text.find(start_marker)
+          end = text.find(end_marker, start)
+          if start < 0 or end < 0:
+              raise SystemExit("BlackBoxCore sendLogs block not found")
+          replacement = """    public void sendLogs(String caption, boolean async, LogSendListener listener) {
+        Slog.w(TAG, "Remote log collection/upload disabled in privacy-clean build");
+        if (listener != null) {
+            listener.onFailure("Remote log upload disabled");
+        }
+    }
+
+"""
+          core.write_text(text[:start] + replacement + text[end:], encoding="utf-8")
+
+          # 4) Remove the manual Send Logs UI code and preference completely.
+          frag = Path("app/src/main/java/top/niunaijun/blackboxa/view/setting/SettingFragment.kt")
+          text = frag.read_text(encoding="utf-8")
+          text = text.replace("\n        initSendLogs()\n", "\n")
+          method_start = text.find("    private fun initSendLogs() {")
+          if method_start < 0:
+              raise SystemExit("SettingFragment initSendLogs method not found")
+          # Method is the final function before the class closing brace at this pinned commit.
+          class_end = text.rfind("\n}")
+          if class_end < method_start:
+              raise SystemExit("SettingFragment class end not found")
+          frag.write_text(text[:method_start] + text[class_end:] + "\n", encoding="utf-8")
+
           settings = Path("app/src/main/res/xml/setting.xml")
           text = settings.read_text(encoding="utf-8")
           pattern = r'\s*<Preference\s+android:key="send_logs"\s+android:title="Send Logs"\s+android:summary="Upload debug logs to developer"\s*/>'
@@ -92,10 +123,13 @@ jobs:
               raise SystemExit(f"Expected one send_logs preference, removed {n}")
           settings.write_text(text2, encoding="utf-8")
 
-          # 4) Privacy audit: fail the build if the known uploader endpoint or ID remains.
+          # 5) Privacy audit: fail if uploader endpoints, IDs, or manual upload strings remain.
           forbidden = [
               "logs-sender-api.vercel.app",
               "-1003719573856",
+              "Manual Log Upload from Settings",
+              "Upload debug logs to developer",
+              "BlackBox Log Upload",
           ]
           roots = [Path("app/src"), Path("Bcore/src")]
           hits = []
@@ -123,6 +157,8 @@ jobs:
           test "$(git rev-parse HEAD)" = "fd0640919c7903a167abf0215ee68ebeaea53485"
           git diff -- Bcore/src/main/java/top/niunaijun/blackbox/utils/LogSender.java \
                      Bcore/src/main/java/top/niunaijun/blackbox/app/configuration/ClientConfiguration.java \
+                     Bcore/src/main/java/top/niunaijun/blackbox/BlackBoxCore.java \
+                     app/src/main/java/top/niunaijun/blackboxa/view/setting/SettingFragment.kt \
                      app/src/main/res/xml/setting.xml
 
       - name: Build debug APK
