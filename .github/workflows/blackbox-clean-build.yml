@@ -1,0 +1,149 @@
+name: Build BlackBoxReborn Clean
+
+on:
+  push:
+    branches:
+      - blackbox-clean-build
+    paths:
+      - ".github/workflows/blackbox-clean-build.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout helper branch
+        uses: actions/checkout@v4
+
+      - name: Checkout BlackBoxReborn v2.1.0 source
+        uses: actions/checkout@v4
+        with:
+          repository: fdavids77/BlackBoxReborn
+          ref: fd0640919c7903a167abf0215ee68ebeaea53485
+          path: BlackBoxReborn
+          fetch-depth: 1
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install required Android SDK packages
+        shell: bash
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platform-tools" "platforms;android-36" "build-tools;36.1.0" "ndk;27.0.12077973"
+
+      - name: Apply privacy cleanup
+        working-directory: BlackBoxReborn
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          # 1) Defense in depth: replace network uploader with a no-network stub.
+          log_sender = Path("Bcore/src/main/java/top/niunaijun/blackbox/utils/LogSender.java")
+          if not log_sender.exists():
+              raise SystemExit("LogSender.java not found")
+          log_sender.write_text("""package top.niunaijun.blackbox.utils;
+
+          import java.io.File;
+
+          /**
+           * Privacy-clean build: remote log uploading is intentionally disabled.
+           * This class contains no networking code or remote endpoint.
+           */
+          public final class LogSender {
+              private static final String TAG = "LogSender";
+
+              private LogSender() {}
+
+              public static String send(String chatId, File logFile, String caption) {
+                  Slog.w(TAG, "Remote log upload disabled in privacy-clean build");
+                  return "Remote log upload disabled";
+              }
+          }
+          """, encoding="utf-8")
+
+          # 2) Stop BlackBoxCore.sendLogs() before it creates/captures logcat files.
+          cfg = Path("Bcore/src/main/java/top/niunaijun/blackbox/app/configuration/ClientConfiguration.java")
+          text = cfg.read_text(encoding="utf-8")
+          old = 'return "-1003719573856";'
+          if old not in text:
+              raise SystemExit("Expected hard-coded LogSender chat ID not found")
+          cfg.write_text(text.replace(old, "return null;"), encoding="utf-8")
+
+          # 3) Remove the manual Send Logs preference from Settings UI.
+          settings = Path("app/src/main/res/xml/setting.xml")
+          text = settings.read_text(encoding="utf-8")
+          pattern = r'\s*<Preference\s+android:key="send_logs"\s+android:title="Send Logs"\s+android:summary="Upload debug logs to developer"\s*/>'
+          text2, n = re.subn(pattern, "", text, flags=re.MULTILINE)
+          if n != 1:
+              raise SystemExit(f"Expected one send_logs preference, removed {n}")
+          settings.write_text(text2, encoding="utf-8")
+
+          # 4) Privacy audit: fail the build if the known uploader endpoint or ID remains.
+          forbidden = [
+              "logs-sender-api.vercel.app",
+              "-1003719573856",
+          ]
+          roots = [Path("app/src"), Path("Bcore/src")]
+          hits = []
+          for root in roots:
+              for p in root.rglob("*"):
+                  if not p.is_file():
+                      continue
+                  try:
+                      data = p.read_text(encoding="utf-8")
+                  except Exception:
+                      continue
+                  for token in forbidden:
+                      if token in data:
+                          hits.append(f"{p}: {token}")
+          if hits:
+              raise SystemExit("Forbidden telemetry remnants found:\n" + "\n".join(hits))
+
+          print("Privacy cleanup OK: uploader stubbed, chat ID removed, Send Logs UI removed.")
+          PY
+
+      - name: Verify pinned upstream commit
+        working-directory: BlackBoxReborn
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD)" = "fd0640919c7903a167abf0215ee68ebeaea53485"
+          git diff -- Bcore/src/main/java/top/niunaijun/blackbox/utils/LogSender.java \
+                     Bcore/src/main/java/top/niunaijun/blackbox/app/configuration/ClientConfiguration.java \
+                     app/src/main/res/xml/setting.xml
+
+      - name: Build debug APK
+        working-directory: BlackBoxReborn
+        shell: bash
+        run: |
+          chmod +x gradlew
+          ./gradlew :app:assembleDebug --stacktrace --no-daemon
+
+      - name: Create checksums
+        working-directory: BlackBoxReborn
+        shell: bash
+        run: |
+          find app/build/outputs/apk/debug -name "*.apk" -type f -print0 | sort -z | xargs -0 sha256sum | tee app/build/outputs/apk/debug/SHA256SUMS.txt
+
+      - name: Upload clean APKs
+        uses: actions/upload-artifact@v4
+        with:
+          name: BlackBoxReborn-v2.1.0-clean
+          path: |
+            BlackBoxReborn/app/build/outputs/apk/debug/*.apk
+            BlackBoxReborn/app/build/outputs/apk/debug/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 7
